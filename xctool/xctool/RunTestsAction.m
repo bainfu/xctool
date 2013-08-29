@@ -458,24 +458,31 @@ typedef BOOL (^TestableBlock)(NSArray *reporters);
                                          environment:info.expandedEnvironment
                                      testRunnerClass:testRunnerClass
                                            gcEnabled:garbageCollectionEnabled];
+        NSArray *annotatedBlock = @[block, info.buildSettings[@"FULL_PRODUCT_NAME"]];
         if (isApplicationTest) {
-          [blocksToRunOnMainThread addObject:block];
+          [blocksToRunOnMainThread addObject:annotatedBlock];
         } else {
-          [blocksToRunOnDispatchQueue addObject:block];
+          [blocksToRunOnDispatchQueue addObject:annotatedBlock];
         }
       }
     }
   }
 
   __block BOOL succeeded = YES;
+  __block NSMutableArray *bundlesInQueue = [NSMutableArray array];
 
-  void (^runTestableBlockAndSaveSuccess)(TestableBlock) = ^(TestableBlock block) {
+  void (^runTestableBlockAndSaveSuccess)(TestableBlock, NSString*) = ^(TestableBlock block, NSString* bundleName) {
     NSArray *reporters;
 
     if (_parallelize) {
       // Buffer reporter output, and we'll make sure it gets flushed serially
       // when the block is done.
       reporters = [EventBuffer wrapSinks:options.reporters];
+      @synchronized (self) {
+        [bundlesInQueue addObject:bundleName];
+        ReportStatusMessage(reporters, REPORTER_MESSAGE_INFO, @"Bundle just started: %@", bundleName);
+        [reporters makeObjectsPerformSelector:@selector(flush)];
+      }
     } else {
       reporters = options.reporters;
     }
@@ -484,6 +491,10 @@ typedef BOOL (^TestableBlock)(NSArray *reporters);
 
     @synchronized (self) {
       if (_parallelize) {
+        [bundlesInQueue removeObject:bundleName];
+        if ([bundlesInQueue count] > 0) {
+          ReportStatusMessage(reporters, REPORTER_MESSAGE_INFO, @"Bundle(s) running: %@", [bundlesInQueue componentsJoinedByString:@","]);
+        }
         [reporters makeObjectsPerformSelector:@selector(flush)];
       }
 
@@ -491,11 +502,11 @@ typedef BOOL (^TestableBlock)(NSArray *reporters);
     }
   };
 
-  for (TestableBlock block in blocksToRunOnDispatchQueue) {
+  for (NSArray *annotatedBlock in blocksToRunOnDispatchQueue) {
     dispatch_group_async(group, q, ^{
       dispatch_semaphore_wait(jobLimiter, DISPATCH_TIME_FOREVER);
 
-      runTestableBlockAndSaveSuccess(block);
+      runTestableBlockAndSaveSuccess(annotatedBlock[0], annotatedBlock[1]);
 
       dispatch_semaphore_signal(jobLimiter);
     });
@@ -504,8 +515,8 @@ typedef BOOL (^TestableBlock)(NSArray *reporters);
   // Wait for logic tests to finish before we start running simulator tests.
   dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 
-  for (TestableBlock block in blocksToRunOnMainThread) {
-    runTestableBlockAndSaveSuccess(block);
+  for (NSArray *annotatedBlock in blocksToRunOnMainThread) {
+    runTestableBlockAndSaveSuccess(annotatedBlock[0], annotatedBlock[1]);
   }
 
   dispatch_release(group);
